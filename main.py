@@ -80,8 +80,10 @@ async def chat_completions(request: ChatCompletionRequest):
         }
     
     # --- 真正的 Streaming 轉發 ---
-    async def stream_generator():
+    def stream_generator():
         try:
+            yield f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n"
+            
             # 這裡確保 agent.route_question 內部也是用 yield 實時產出
             for chunk in agent.route_question(user_input, allowDeepThink=True):
                 if not chunk: continue
@@ -93,13 +95,24 @@ async def chat_completions(request: ChatCompletionRequest):
                 yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
             
             # 結束標記
-            yield f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+            stop_json = {"id": chat_id, "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+            yield f"data: {json.dumps(stop_json)}\n\n"
             yield "data: [DONE]\n\n"
+
         except Exception as e:
             error_data = {"error": {"message": str(e), "type": "server_error"}}
             yield f"data: {json.dumps(error_data)}\n\n"
 
-    return StreamingResponse(stream_generator(), media_type="text/event-stream")
+# 🟢 這裡的 Headers 非常重要，可以強制關閉 Nginx/反向代理的緩衝
+    return StreamingResponse(
+        stream_generator(), 
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache", 
+            "Connection": "keep-alive", 
+            "X-Accel-Buffering": "no" # 👈 強制禁用緩衝
+        }
+    )
 
 # --- 7. 多模態路由：/api/omni ---
 @app.post("/api/omni", dependencies=[Depends(verify_api_key)])

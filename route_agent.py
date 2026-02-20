@@ -1,6 +1,7 @@
 import time
 import requests
 import json
+import threading
 import global_var
 from memory_bank import MemoryBank
 
@@ -52,8 +53,8 @@ class RouteAgent:
         difficulty = self.determine_difficulty(user_input)
         
         yield f"✅ 路由判定：{difficulty}\n"
-        yield f"📚 知識庫檢索完成\n"
-        yield f"啟動大腦中...\n"
+        yield "📚 知識庫檢索完成\n"
+        yield "啟動大腦中...\n"
         yield "</thinking>\n\n" # 結束思考區塊，準備輸出正文
         
         config = {
@@ -75,44 +76,38 @@ class RouteAgent:
             "stream": True 
         }
 
-        full_answer = []
         print(f"📡 正在請求模型: {target_model} @ {target_url}", flush=True)
 
+        full_content = ""
         try:
+            # 使用 stream=True 請求 8607/8603
             with requests.post(target_url, json=payload, timeout=timeout_val, stream=True) as resp:
-                print(f"📥 模型回應狀態碼: {resp.status_code}", flush=True)
-                
-                for line in resp.iter_lines():
-                    if not line:
-                        continue
+                for line in resp.iter_lines(chunk_size=1):
+                    if not line: continue
                     
                     line_text = line.decode("utf-8").strip()
-                    # 🔴 偵錯用：印出原始行數據
-                    # print(f"DEBUG RAW LINE: {line_text}", flush=True)
-
                     if line_text.startswith("data: "):
-                        data_str = line_text[6:].strip()
-                        if data_str == "[DONE]":
-                            break
+                        data_str = line_text[6:]
+                        if data_str == "[DONE]": break
                         
                         try:
                             data_json = json.loads(data_str)
-                            # 💡 關鍵檢查：有啲模型 delta 入面係 'text' 而唔係 'content'
-                            choices = data_json.get('choices', [{}])
-                            delta = choices[0].get('delta', {})
-                            
-                            # 兼容不同模型的欄位名
-                            chunk = delta.get('content') or delta.get('text') or ""
-                            
+                            delta = data_json['choices'][0].get('delta', {})
+                            chunk = delta.get('content') or ""
                             if chunk:
-                                full_answer.append(chunk)
-                                yield chunk
-                        except Exception as e:
-                            print(f"⚠️ JSON 解析失敗: {e} | 原文: {data_str}", flush=True)
-                            continue
-            
-            if full_answer:
-                self.mb.save_memory(user_input, "".join(full_answer))
+                                full_content += chunk
+                                yield chunk # 👈 即時 yield 給 main.py
+                        except: continue
+
+            # 全部完咗先一次過存入記憶，唔好喺 yield 中間做，費事拖慢速度
+            if full_content:
+                print(f"💾 正在背景儲存記憶...", flush=True)
+                # 使用 threading 異步執行，不阻塞當前的 yield 流程
+                save_thread = threading.Thread(
+                    target=self.mb.save_memory, 
+                    args=(user_input, full_content)
+                )
+                save_thread.start()
+
         except Exception as e:
-            print(f"❌ 串流發生異常: {e}", flush=True)
-            yield f"❌ 系統連線異常: {str(e)}"
+            yield f"\n❌ 大腦連線中斷: {str(e)}"

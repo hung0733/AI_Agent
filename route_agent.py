@@ -43,15 +43,18 @@ class RouteAgent:
             return "MEDIUM"
     
     def route_question(self, user_input, allowDeepThink=False):
-        # 1. 先輸出一個訊息，讓前端立刻有反應，解決長 Load 轉圈
-        yield "🔍 小丸正在思考問題深度...\n"
+        # 1. 進入思考區塊
+        yield "<thinking>\n"
+        yield "🔍 正在分析問題複雜度與檢索知識庫...\n"
         
         # 檢索與難度判斷 (這兩步現在是阻塞的，但前端已經收到上面的字了)
         context = self.mb.get_context(user_input)
         difficulty = self.determine_difficulty(user_input)
         
-        # 2. 顯示判斷結果
-        yield f"✅ 判定難度：{difficulty}，啟動大腦中...\n\n"
+        yield f"✅ 路由判定：{difficulty}\n"
+        yield f"📚 知識庫檢索完成\n"
+        yield f"啟動大腦中...\n"
+        yield "</thinking>\n\n" # 結束思考區塊，準備輸出正文
         
         config = {
             "HARD": (global_var.PORTS["80B"], global_var.MODELS["80B"], 900, "\n(當前模式：深度思考)"),

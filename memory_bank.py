@@ -1,5 +1,6 @@
 import time
 import requests
+import uuid
 import global_var
 
 from qdrant_client import QdrantClient
@@ -89,7 +90,7 @@ class MemoryBank:
                     self.client.upsert(
                         collection_name="chat_memory",
                         points=[models.PointStruct(
-                            id=hash(str(time.time())) & 0xFFFFFFFFFFFFFFFF,
+                            id=str(uuid.uuid4()),  # <--- 改成使用 UUID
                             vector=vec,
                             payload={"content": summary, "time": time.ctime()}
                         )]

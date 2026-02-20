@@ -106,7 +106,7 @@ class RouteAgent:
         except Exception as e:
             print(f"❌ {target_model} 連接失敗/超時: {e}", flush=True)
             
-            if difficulty == "HARD":
+            if active_level == "HARD":
                 print(f"🔄 80B 太慢/無反應，嘗試切換回 30B 救場...", flush=True)
                 try:
                     payload["model"] = global_var.MODELS["30B"]

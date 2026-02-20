@@ -6,7 +6,8 @@ PORTS = {
     "15B": "http://localhost:8603/v1/chat/completions",
     "VL":  "http://localhost:8604/v1/chat/completions",
     "EMBED": "http://localhost:8602/embeddings",
-    "QDRANT": {"host": "localhost", "port": 6333}
+    "QDRANT": {"host": "localhost", "port": 6333},
+    "DIFY": "http://localhost/v1/datasets/retrieval"
 }
 
 MODELS = {

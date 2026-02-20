@@ -5,6 +5,8 @@ import global_var
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 
+
+
 class MemoryBank:
     def __init__(self):
         # 1. 初始化時直接連接並檢查 Collections
@@ -33,6 +35,58 @@ class MemoryBank:
                     )
         except: pass
 
+    def _get_dify_context(self, query_text):
+        """
+        根據 Dify 官方回傳結構解析知識庫內容
+        """
+        # 1. 基本配置 (請確保 dataset_id 正確)
+        DIFY_API_KEY = "dataset-JbnVJj7QfATRC9L8OqbZCB1U"
+        DATASET_ID = "949aa016-3dff-45e3-9f9a-0298b19ef304"
+
+        DIFY_URL = f"http://localhost/v1/datasets/{DATASET_ID}/retrieve"
+        
+        headers = {
+            "Authorization": f"Bearer {DIFY_API_KEY}",
+            "Content-Type": "application/json"
+        }
+
+        # 2. 檢索參數 (對標你提供的 Retrieve 格式)
+        payload = {
+            "query": query_text,
+            "retrieval_model": {
+                "search_method": "hybrid_search",
+                "reranking_enable": False, # 👈 設為 False
+                "top_k": 5,
+                "weights": 0.5, # 向量與關鍵字各佔一半權重
+                "score_threshold_enabled": False
+            }
+        }
+
+        try:
+            resp = requests.post(DIFY_URL, json=payload, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                records = data.get('records', [])
+                
+                parts = []
+                for rec in records:
+                    # 💡 重點修正：根據你提供的 JSON 結構，內容在 segment 內
+                    segment = rec.get('segment', {})
+                    text_content = segment.get('content', '')
+                    
+                    if text_content:
+                        # 獲取檔案來源名稱 (如果有)
+                        doc_name = segment.get('document', {}).get('name', '知識庫文檔')
+                        parts.append(f"【參考來源: {doc_name}】\n{text_content}")
+                
+                return "\n\n".join(parts) if parts else ""
+            else:
+                print(f"⚠️ Dify 檢索失敗: {resp.status_code} - {resp.text}", flush=True)
+                return ""
+        except Exception as e:
+            print(f"❌ Dify 連線異常: {e}", flush=True)
+            return ""
+
     def _get_vector(self, text):
         """(私有方法) 取得文字的向量"""
         if not text: return []
@@ -51,27 +105,27 @@ class MemoryBank:
         except: return []
         
     def get_context(self, query_text):
-        """取得對話上下文"""
-        if not self.client: return ""
+        """整合所有來源的上下文"""
+        if not query_text: return []
         print(f"🔍 小丸回憶中...", flush=True)
-        
-        vec = self._get_vector(query_text)
-        if not vec: return ""
-        
+
         parts = []
-        try:
-            k = self.client.search(collection_name="trinity_knowledge", query_vector=vec, limit=2)
-            if k: 
-                t = "\n".join([r.payload.get('text', '') for r in k if r.score > 0.4])
-                if t: parts.append(f"【知識庫】：\n{t}")
-        except: pass
         
-        try:
-            h = self.client.search(collection_name="chat_memory", query_vector=vec, limit=3)
-            if h:
-                t = "\n".join([f"- {r.payload.get('content')} ({r.payload.get('time')})" for r in h if r.score > 0.5])
-                if t: parts.append(f"【回憶】：\n{t}")
-        except: pass
+        # 1. 先去 Dify 找專業知識
+        dify_knowledge = self._get_dify_context(query_text)
+        if dify_knowledge:
+            parts.append(f"【專業知識庫參考資料】：\n{dify_knowledge}")
+            
+        # 2. 再找本地 Qdrant 的對話回憶 (chat_memory)
+        if self.client:
+            vec = self._get_vector(query_text)
+            if vec:
+                try:
+                    h = self.client.search(collection_name="chat_memory", query_vector=vec, limit=2)
+                    mem = "\n".join([f"- {r.payload.get('content')}" for r in h if r.score > 0.5])
+                    if mem:
+                        parts.append(f"【過往對話回憶】：\n{mem}")
+                except: pass
         
         return "\n\n".join(parts) if parts else ""
 
@@ -101,3 +155,44 @@ class MemoryBank:
                     )
                 print(f"💾 寫入記憶: {summary[:20]}...", flush=True)
         except: pass
+        
+    def add_to_knowledge(self, text, metadata=None):
+        """
+        將 Web Client 傳來的知識存入 trinity_knowledge
+        """
+        if not self.client: return 0
+        
+        # 1. 文本切片 (Chunking)
+        chunk_size = 500
+        overlap = 50
+        chunks = [text[i:i + chunk_size] for i in range(0, len(text), chunk_size - overlap)]
+        
+        points = []
+        for chunk in chunks:
+            if not chunk.strip(): continue
+            
+            # 2. 使用私有方法 _get_vector 取得向量
+            vector = self._get_vector(chunk)
+            if not vector: continue
+            
+            # 3. 封裝 Point
+            points.append(models.PointStruct(
+                id=str(uuid.uuid4()),
+                vector=vector,
+                payload={
+                    "text": chunk,  # 👈 這裡必須用 'text'，因為 get_context 是抓這個欄位
+                    "metadata": metadata or {},
+                    "source": "web_upload",
+                    "timestamp": time.time()
+                }
+            ))
+        
+        # 4. 批量寫入 Qdrant
+        if points:
+            self.client.upsert(
+                collection_name="trinity_knowledge",
+                points=points
+            )
+            print(f"📚 知識入庫成功: 增加了 {len(points)} 個區塊", flush=True)
+            return len(points)
+        return 0

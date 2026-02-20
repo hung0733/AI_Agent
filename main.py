@@ -1,11 +1,13 @@
 # main.py
 import time
+import json
 import base64
 import requests
 from typing import List, Optional
 from fastapi import FastAPI, Depends, HTTPException, status, Form, UploadFile, File
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 
@@ -25,7 +27,8 @@ app.add_middleware(
 
 # --- 2. API Key 驗證設定 ---
 security = HTTPBearer()
-API_KEY = "sk-trinity-agent-secret-key" # ⚠️ 請修改為你的密碼
+# 你指定的新 API Key
+API_KEY = "QUktSFVORyBTZXJ2ZXIgQUkgQWdlbnQ"
 
 def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
     if credentials.credentials != API_KEY:
@@ -36,43 +39,69 @@ def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)
         )
     return credentials.credentials
 
-# --- 3. OpenAI 相容的資料結構 ---
+# --- 3. 初始化大腦 ---
+# 確保在全域初始化一次，避免每次 Request 都重連 Qdrant
+agent = RouteAgent()
+
+# --- 4. OpenAI 相容的資料結構 ---
 class ChatMessage(BaseModel):
     role: str
     content: str
 
 class ChatCompletionRequest(BaseModel):
-    model: str = "trinity-router"
+    model: str = "qwen3-trinity"
     messages: List[ChatMessage]
     temperature: Optional[float] = 0.7
-    stream: Optional[bool] = False
+    stream: Optional[bool] = True
 
-# --- 4. 路由：/v1/chat/completions (純文字大腦路由入口) ---
+# --- 5. OpenAI 標準 Model List API ---
+@app.get("/v1/models", dependencies=[Depends(verify_api_key)])
+async def list_models():
+    models = [
+        {"id": "qwen3-trinity", "object": "model", "created": int(time.time()), "owned_by": "trinity"},
+        {"id": "qwen3-omni", "object": "model", "created": int(time.time()), "owned_by": "trinity"},
+    ]
+    return {"object": "list", "data": models}
+
+# --- 6. 核心路由：/v1/chat/completions (支援 Stream) ---
 @app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
 async def chat_completions(request: ChatCompletionRequest):
-    try:
-        user_message = request.messages[-1].content
-        
-        # 呼叫你寫好嘅 RouteAgent (根據你上傳嘅版本，使用 @staticmethod)
-        answer = RouteAgent.route_question(user_message, allowDeepThink=True)
-        
+    user_input = request.messages[-1].content
+    chat_id = f"chatcmpl-{int(time.time())}"
+    created_time = int(time.time())
+    
+    # --- 支援 Non-stream (例如 Dify 校驗) ---
+    if not request.stream:
+        full_answer = "".join([chunk for chunk in agent.route_question(user_input, allowDeepThink=True)])
         return {
-            "id": f"chatcmpl-{int(time.time())}",
-            "object": "chat.completion",
-            "created": int(time.time()),
+            "id": chat_id, "object": "chat.completion", "created": created_time,
             "model": request.model,
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": answer},
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": full_answer}, "finish_reason": "stop"}]
         }
-    except Exception as e:
-        print(f"❌ API 發生錯誤: {e}", flush=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    
+    # --- 真正的 Streaming 轉發 ---
+    async def stream_generator():
+        try:
+            # 這裡確保 agent.route_question 內部也是用 yield 實時產出
+            for chunk in agent.route_question(user_input, allowDeepThink=True):
+                if not chunk: continue
+                chunk_data = {
+                    "id": chat_id, "object": "chat.completion.chunk", "created": created_time,
+                    "model": request.model,
+                    "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}]
+                }
+                yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
+            
+            # 結束標記
+            yield f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            error_data = {"error": {"message": str(e), "type": "server_error"}}
+            yield f"data: {json.dumps(error_data)}\n\n"
 
-# --- 5. 路由：/api/omni (感官接收 -> Omni 轉譯 -> 路由大腦) ---
+    return StreamingResponse(stream_generator(), media_type="text/event-stream")
+
+# --- 7. 多模態路由：/api/omni ---
 @app.post("/api/omni", dependencies=[Depends(verify_api_key)])
 async def omni_endpoint(
     text: Optional[str] = Form(None),
@@ -80,82 +109,59 @@ async def omni_endpoint(
     audio: Optional[UploadFile] = File(None)
 ):
     try:
-        print("👁️👂 啟動 Omni 感官接收...", flush=True)
         content_list = []
+        user_prompt = text if text else "請分析內容。"
+        content_list.append({"type": "text", "text": user_prompt})
 
-        # 1. 處理文字 (如果冇文字，畀個預設 prompt 佢)
-        user_text = text if text else "請綜合分析提供的圖片與語音，轉化成文字描述或問題。"
-        content_list.append({"type": "text", "text": user_text})
-
-        # 2. 處理圖片轉 Base64
         if image:
             img_bytes = await image.read()
             img_b64 = base64.b64encode(img_bytes).decode("utf-8")
-            img_mime = image.content_type or "image/jpeg"
             content_list.append({
                 "type": "image_url",
-                "image_url": {"url": f"data:{img_mime};base64,{img_b64}"}
+                "image_url": {"url": f"data:{image.content_type};base64,{img_b64}"}
             })
-            print(f"📸 收到圖片: {image.filename} ({img_mime})", flush=True)
 
-        # 3. 處理聲音轉 Base64
         if audio:
             audio_bytes = await audio.read()
             audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
-            audio_mime = audio.content_type or "audio/wav"
-            # 備註：vLLM 或多模態引擎通常使用 audio_url 欄位接收音檔
             content_list.append({
-                "type": "audio_url", 
-                "audio_url": {"url": f"data:{audio_mime};base64,{audio_b64}"}
+                "type": "audio_url",
+                "audio_url": {"url": f"data:{audio.content_type};base64,{audio_b64}"}
             })
-            print(f"🎤 收到語音: {audio.filename} ({audio_mime})", flush=True)
 
-        # 4. 呼叫 Omni 模型進行理解與轉譯
+        # 呼叫 Omni 模型理解
         omni_payload = {
             "model": global_var.MODELS["30B_OMNI"],
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "你係AI系統的「感官神經」。請綜合理解用戶提供的語音、圖片及文字。將它們翻譯、總結並轉化為一個清晰的純文字問題或指令。只需輸出轉換後的純文字，不要包含任何解釋、問候或多餘字句。"
-                },
-                {
-                    "role": "user",
-                    "content": content_list
-                }
-            ],
+            "messages": [{"role": "user", "content": content_list}],
             "temperature": 0.2
         }
+        resp = requests.post(global_var.PORTS["30B_OMNI"], json=omni_payload, timeout=60)
+        omni_text = resp.json()['choices'][0]['message']['content'].strip()
 
-        print(f"📡 傳送資料至 Omni 模型 ({global_var.MODELS['30B_OMNI']})...", flush=True)
-        omni_resp = requests.post(global_var.PORTS["30B_OMNI"], json=omni_payload, timeout=60)
-        
-        if omni_resp.status_code != 200:
-            raise Exception(f"Omni 模型 HTTP 錯誤: {omni_resp.status_code} - {omni_resp.text}")
+        # 將理解後的文字送入大腦路由
+        final_answer = agent.route_question(omni_text, allowDeepThink=True)
 
-        # 擷取 Omni 理解後轉換出的純文字
-        omni_analyzed_text = omni_resp.json()['choices'][0]['message']['content'].strip()
-        print(f"✅ Omni 分析完成，轉譯文字為: 「{omni_analyzed_text}」", flush=True)
-
-        # 5. 將 Omni 分析完的純文字，交畀 Routing Agent 做難度判斷與深度回答
-        print(f"🧠 將轉譯結果交畀大腦路由處理...", flush=True)
-        final_answer = RouteAgent.route_question(omni_analyzed_text, allowDeepThink=True)
-
-        # 6. 回傳最終結果 (未來可以加 TTS 將文字轉語音放喺 audio_base64)
         return {
             "status": "success",
             "agent_response": {
                 "text": final_answer,
-                "audio_base64": "", # 預留畀「口」
-                "expression": "Smile", 
+                "expression": "Smile",
                 "action": "Nodding"
-            },
-            # 回傳埋 Omni 嘅轉譯結果，方便前端 debug 睇吓佢理解得啱唔啱
-            "omni_transcription": omni_analyzed_text 
+            }
         }
-        
     except Exception as e:
-        print(f"❌ Omni 端點發生錯誤: {e}", flush=True)
         raise HTTPException(status_code=500, detail=str(e))
+    
+@app.post("/v1/knowledge/add")
+async def add_knowledge(data: dict):
+    text = data.get("content")
+    filename = data.get("filename", "manual_input")
+    if not text:
+        return {"error": "No content provided"}
+
+    # 調用 MemoryBank 的 add_to_knowledge
+    count = agent.mb.add_to_knowledge(text, {"filename": filename})
+    return {"status": "success", "chunks_added": count}
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8600, reload=True)

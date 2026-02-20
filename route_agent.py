@@ -1,5 +1,6 @@
 import time
 import requests
+import json
 import global_var
 from memory_bank import MemoryBank
 
@@ -42,68 +43,73 @@ class RouteAgent:
             return "MEDIUM"
     
     def route_question(self, user_input, allowDeepThink=False):
-        # 1. 檢索 RAG 上下文 (直接調用自身的 mb)
-        context = self.mb.get_context(user_input)
+        # 1. 先輸出一個訊息，讓前端立刻有反應，解決長 Load 轉圈
+        yield "🔍 小丸正在思考問題深度...\n"
         
-        # 2. 判斷難度 (調用自身的方法)
+        # 檢索與難度判斷 (這兩步現在是阻塞的，但前端已經收到上面的字了)
+        context = self.mb.get_context(user_input)
         difficulty = self.determine_difficulty(user_input)
         
-        # 3. 決定路由參數
+        # 2. 顯示判斷結果
+        yield f"✅ 判定難度：{difficulty}，啟動大腦中...\n\n"
+        
         config = {
-            "HARD": (global_var.PORTS["80B"], global_var.MODELS["80B"], 900, "\n(當前模式：深度思考。請提供極具邏輯性、結構嚴謹、有深度的詳細回答。)", "🎓 召喚 80B 博士..."),
-            "MEDIUM": (global_var.PORTS["30B"], global_var.MODELS["30B"], 150, "", "⚡ 使用 30B 主腦..."),
-            "EASY": (global_var.PORTS["15B"], global_var.MODELS["15B"], 30, "", "🐇 使用 1.5B 快速回應...")
+            "HARD": (global_var.PORTS["80B"], global_var.MODELS["80B"], 900, "\n(當前模式：深度思考)"),
+            "MEDIUM": (global_var.PORTS["30B"], global_var.MODELS["30B"], 150, ""),
+            "EASY": (global_var.PORTS["15B"], global_var.MODELS["15B"], 30, "")
         }
         
-        # 如果 HARD 但不允許 DeepThink，自動降級到 MEDIUM
-        active_level = difficulty
-        if difficulty == "HARD" and not allowDeepThink:
-            active_level = "MEDIUM"
-            
-        target_url, target_model, timeout_val, extra_prompt, msg = config[active_level]
-        sys_prompt = global_var.SYSTEM_PROMPT + extra_prompt
+        active_level = "MEDIUM" if (difficulty == "HARD" and not allowDeepThink) else difficulty
+        target_url, target_model, timeout_val, extra_prompt = config[active_level][:4]
         
-        print(msg, flush=True)
-
         payload = {
             "model": target_model,
             "messages": [
-                {"role": "system", "content": sys_prompt},
+                {"role": "system", "content": global_var.SYSTEM_PROMPT + extra_prompt},
                 {"role": "user", "content": f"【背景資料】：\n{context}\n\n【用戶問題】：{user_input}"}
             ],
-            "temperature": 0.7
+            "temperature": 0.7,
+            "stream": True 
         }
 
-        try:
-            start_t = time.time()
-            resp = requests.post(target_url, json=payload, timeout=timeout_val)
-            
-            if resp.status_code != 200:
-                raise Exception(f"Status {resp.status_code}")
-                
-            answer = resp.json()['choices'][0]['message']['content']
-            duration = time.time() - start_t
-            
-            speed = len(answer) / duration if duration > 0 else 0
-            print(f"✅ 生成完畢 (耗時: {duration:.1f}s | 速度: ~{speed:.1f} chars/s)", flush=True)
-            
-            # 儲存記憶
-            self.mb.save_memory(user_input, answer)
-            return answer
+        full_answer = []
+        print(f"📡 正在請求模型: {target_model} @ {target_url}", flush=True)
 
-        except Exception as e:
-            print(f"❌ {target_model} 連接失敗/超時: {e}", flush=True)
-            
-            # 修正後的降級容錯邏輯
-            if active_level == "HARD":
-                print(f"🔄 80B 太慢/無反應，嘗試切換回 30B 救場...", flush=True)
-                try:
-                    payload["model"] = global_var.MODELS["30B"]
-                    resp = requests.post(global_var.PORTS["30B"], json=payload, timeout=120)
-                    answer = resp.json()['choices'][0]['message']['content']
+        try:
+            with requests.post(target_url, json=payload, timeout=timeout_val, stream=True) as resp:
+                print(f"📥 模型回應狀態碼: {resp.status_code}", flush=True)
+                
+                for line in resp.iter_lines():
+                    if not line:
+                        continue
                     
-                    self.mb.save_memory(user_input, answer) 
-                    return answer + "\n(⚠️ 註：博士思考超時，此乃 30B 代答)"
-                except:
-                    return "抱歉，連接超時，請稍後再試。"
-            return "系統繁忙，請稍後再試。"
+                    line_text = line.decode("utf-8").strip()
+                    # 🔴 偵錯用：印出原始行數據
+                    # print(f"DEBUG RAW LINE: {line_text}", flush=True)
+
+                    if line_text.startswith("data: "):
+                        data_str = line_text[6:].strip()
+                        if data_str == "[DONE]":
+                            break
+                        
+                        try:
+                            data_json = json.loads(data_str)
+                            # 💡 關鍵檢查：有啲模型 delta 入面係 'text' 而唔係 'content'
+                            choices = data_json.get('choices', [{}])
+                            delta = choices[0].get('delta', {})
+                            
+                            # 兼容不同模型的欄位名
+                            chunk = delta.get('content') or delta.get('text') or ""
+                            
+                            if chunk:
+                                full_answer.append(chunk)
+                                yield chunk
+                        except Exception as e:
+                            print(f"⚠️ JSON 解析失敗: {e} | 原文: {data_str}", flush=True)
+                            continue
+            
+            if full_answer:
+                self.mb.save_memory(user_input, "".join(full_answer))
+        except Exception as e:
+            print(f"❌ 串流發生異常: {e}", flush=True)
+            yield f"❌ 系統連線異常: {str(e)}"

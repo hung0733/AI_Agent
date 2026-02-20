@@ -1,20 +1,14 @@
 import time
 import requests
 import global_var
-
 from memory_bank import MemoryBank
 
 class RouteAgent:
-    _mb = None
-
-    @classmethod
-    def get_mb(cls):
-        if cls._mb is None:
-            cls._mb = MemoryBank()
-        return cls._mb
+    def __init__(self):
+        # 實例化時自動綁定一個記憶庫
+        self.mb = MemoryBank()
     
-    @staticmethod
-    def determine_difficulty(user_input):
+    def determine_difficulty(self, user_input):
         gatekeeper_prompt = f"""
         你是 AI 路由分類員。請分析用戶輸入，嚴格判斷是否需要「博士級」模型處理。
         
@@ -47,17 +41,14 @@ class RouteAgent:
         except:
             return "MEDIUM"
     
-    @staticmethod
-    def route_question(user_input, allowDeepThink = False):
-        mb = RouteAgent.get_mb()
+    def route_question(self, user_input, allowDeepThink=False):
+        # 1. 檢索 RAG 上下文 (直接調用自身的 mb)
+        context = self.mb.get_context(user_input)
         
-        # 1. 檢索 RAG 上下文
-        context = mb.get_context(user_input)
+        # 2. 判斷難度 (調用自身的方法)
+        difficulty = self.determine_difficulty(user_input)
         
-        # 2. 判斷難度
-        difficulty = RouteAgent.determine_difficulty(user_input)
-        
-        # 3. 決定路由參數 (這裡可以重構成一個 Dict 映射表，更優雅)
+        # 3. 決定路由參數
         config = {
             "HARD": (global_var.PORTS["80B"], global_var.MODELS["80B"], 900, "\n(當前模式：深度思考。請提供極具邏輯性、結構嚴謹、有深度的詳細回答。)", "🎓 召喚 80B 博士..."),
             "MEDIUM": (global_var.PORTS["30B"], global_var.MODELS["30B"], 150, "", "⚡ 使用 30B 主腦..."),
@@ -70,12 +61,10 @@ class RouteAgent:
             active_level = "MEDIUM"
             
         target_url, target_model, timeout_val, extra_prompt, msg = config[active_level]
-        
         sys_prompt = global_var.SYSTEM_PROMPT + extra_prompt
         
         print(msg, flush=True)
 
-        # 執行生成
         payload = {
             "model": target_model,
             "messages": [
@@ -87,7 +76,6 @@ class RouteAgent:
 
         try:
             start_t = time.time()
-            # 發送請求
             resp = requests.post(target_url, json=payload, timeout=timeout_val)
             
             if resp.status_code != 200:
@@ -96,16 +84,17 @@ class RouteAgent:
             answer = resp.json()['choices'][0]['message']['content']
             duration = time.time() - start_t
             
-            # 計算生成速度 (估算)
             speed = len(answer) / duration if duration > 0 else 0
             print(f"✅ 生成完畢 (耗時: {duration:.1f}s | 速度: ~{speed:.1f} chars/s)", flush=True)
             
-            mb.save_memory(user_input, answer)
+            # 儲存記憶
+            self.mb.save_memory(user_input, answer)
             return answer
 
         except Exception as e:
             print(f"❌ {target_model} 連接失敗/超時: {e}", flush=True)
             
+            # 修正後的降級容錯邏輯
             if active_level == "HARD":
                 print(f"🔄 80B 太慢/無反應，嘗試切換回 30B 救場...", flush=True)
                 try:
@@ -113,10 +102,8 @@ class RouteAgent:
                     resp = requests.post(global_var.PORTS["30B"], json=payload, timeout=120)
                     answer = resp.json()['choices'][0]['message']['content']
                     
-                    # 💡 記得補上記憶儲存
-                    mb.save_memory(user_input, answer) 
-                    
+                    self.mb.save_memory(user_input, answer) 
                     return answer + "\n(⚠️ 註：博士思考超時，此乃 30B 代答)"
                 except:
                     return "抱歉，連接超時，請稍後再試。"
-            return "系統繁忙，請稍後再試。"           
+            return "系統繁忙，請稍後再試。"

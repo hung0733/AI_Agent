@@ -12,6 +12,10 @@ class Config:
     URL_TEXT = "http://localhost:8607/v1/chat/completions"
     MODEL_TEXT = "qwen-80b-instruct"
 
+# --- 視覺引導語 ---
+    # 確保 Vision Model 輸出最詳盡嘅描述，方便 80B 思考
+    VISION_PROMPT_PREFIX = "請詳細描述圖中所有細節，包括物件、文字、環境及氛圍，作為後續分析嘅參考資料："
+
     # --- 其他 Backend ---
     URL_WHISPER = "http://localhost:9000/v1/audio/transcriptions"
     URL_TTS = "http://localhost:5000/v1/audio/speech"
